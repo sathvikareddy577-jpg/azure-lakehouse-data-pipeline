@@ -1,59 +1,39 @@
 output "resource_group_name" {
+  description = "Resource group containing the lakehouse platform."
   value       = azurerm_resource_group.lakehouse.name
-  description = "Resource Group name"
-}
-
-output "resource_group_id" {
-  value       = azurerm_resource_group.lakehouse.id
-  description = "Resource Group ID"
-}
-
-output "storage_account_id" {
-  value       = azurerm_storage_account.lakehouse.id
-  description = "ADLS Gen2 Storage Account ID"
 }
 
 output "storage_account_name" {
+  description = "Unique ADLS Gen2 storage account name."
   value       = azurerm_storage_account.lakehouse.name
-  description = "ADLS Gen2 Storage Account name"
 }
 
-output "storage_primary_dfs_endpoint" {
+output "storage_dfs_endpoint" {
+  description = "Hierarchical namespace endpoint for ABFS access."
   value       = azurerm_storage_account.lakehouse.primary_dfs_endpoint
-  description = "Primary DFS endpoint for ADLS Gen2"
-}
-
-output "raw_filesystem_id" {
-  value       = azurerm_storage_data_lake_gen2_filesystem.raw.id
-  description = "Raw filesystem ID"
-}
-
-output "warehouse_filesystem_id" {
-  value       = azurerm_storage_data_lake_gen2_filesystem.warehouse.id
-  description = "Warehouse filesystem ID"
-}
-
-output "quarantine_filesystem_id" {
-  value       = azurerm_storage_data_lake_gen2_filesystem.quarantine.id
-  description = "Quarantine filesystem ID"
-}
-
-output "databricks_workspace_id" {
-  value       = azurerm_databricks_workspace.lakehouse.id
-  description = "Databricks Workspace ID"
 }
 
 output "databricks_workspace_url" {
+  description = "Azure Databricks workspace URL."
   value       = azurerm_databricks_workspace.lakehouse.workspace_url
-  description = "Databricks Workspace URL"
 }
 
-output "vnet_id" {
-  value       = azurerm_virtual_network.lakehouse.id
-  description = "Virtual Network ID"
+output "databricks_workspace_resource_id" {
+  description = "Resource ID used by the ADF Databricks linked service."
+  value       = azurerm_databricks_workspace.lakehouse.id
 }
 
-output "databricks_subnet_id" {
-  value       = azurerm_subnet.databricks.id
-  description = "Databricks Subnet ID"
+output "databricks_access_connector_id" {
+  description = "Managed-identity access connector for ADLS permissions."
+  value       = azurerm_databricks_access_connector.lakehouse.id
+}
+
+output "data_factory_name" {
+  description = "Azure Data Factory orchestrator name."
+  value       = azurerm_data_factory.lakehouse.name
+}
+
+output "adls_filesystems" {
+  description = "Created lakehouse filesystem names."
+  value       = sort(keys(azurerm_storage_data_lake_gen2_filesystem.layers))
 }

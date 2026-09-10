@@ -1,76 +1,49 @@
-"""Databricks Auto Loader configuration for incremental ingestion"""
+"""Azure Databricks Auto Loader helpers for incremental cloud-file ingestion."""
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, current_timestamp, lit
+from __future__ import annotations
+
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.streaming import StreamingQuery
+from pyspark.sql.types import StructType
 
 
-def setup_autoloader_customers(spark: SparkSession, source_path: str, checkpoint_path: str, target_table: str):
-    """
-    Setup Auto Loader for incremental customer data ingestion.
-    
-    Args:
-        spark: Spark session
-        source_path: ADLS path to customer CSV files (e.g., abfss://raw@lakehouse.dfs.core.windows.net/customers/)
-        checkpoint_path: Checkpoint location for Auto Loader state
-        target_table: Target Delta table (e.g., bronze.customers)
-    
-    Example:
-        source_path = "abfss://raw@lakehousedata.dfs.core.windows.net/customers/"
-        checkpoint = "abfss://warehouse@lakehousedata.dfs.core.windows.net/_checkpoints/customers"
-        setup_autoloader_customers(spark, source_path, checkpoint, "bronze.customers")
-    """
-    df = spark.readStream \
-        .format("cloudFiles") \
-        .option("cloudFiles.format", "csv") \
-        .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema") \
-        .option("header", "true") \
+def build_autoloader_stream(
+    spark: SparkSession,
+    source_path: str,
+    checkpoint_path: str,
+    source_format: str,
+    schema: StructType,
+) -> DataFrame:
+    """Create a schema-controlled Auto Loader stream with rescued data."""
+    return (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", source_format)
+        .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema")
+        .option("cloudFiles.schemaEvolutionMode", "rescue")
+        .option("rescuedDataColumn", "_rescued_data")
+        .option("header", "true")
+        .schema(schema)
         .load(source_path)
-    
-    df = df.withColumn("load_timestamp", current_timestamp()) \
-           .withColumn("source_system", lit("autoloader"))
-    
-    query = df.writeStream \
-        .format("delta") \
-        .option("checkpointLocation", f"{checkpoint_path}/state") \
-        .option("mergeSchema", "true") \
-        .mode("append") \
-        .table(target_table)
-    
-    return query
+        .withColumn("_source_file", F.input_file_name())
+        .withColumn("_source_system", F.lit("databricks_autoloader"))
+        .withColumn("_ingested_at", F.current_timestamp())
+    )
 
 
-def setup_autoloader_orders(spark: SparkSession, source_path: str, checkpoint_path: str, target_table: str):
-    """Setup Auto Loader for incremental order data ingestion."""
-    df = spark.readStream \
-        .format("cloudFiles") \
-        .option("cloudFiles.format", "csv") \
-        .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema") \
-        .option("header", "true") \
-        .load(source_path)
-    
-    df = df.withColumn("load_timestamp", current_timestamp()) \
-           .withColumn("source_system", lit("autoloader"))
-    
-    query = df.writeStream \
-        .format("delta") \
-        .option("checkpointLocation", f"{checkpoint_path}/state") \
-        .option("mergeSchema", "true") \
-        .mode("append") \
-        .table(target_table)
-    
-    return query
-
-
-def setup_autoloader_cdc(spark: SparkSession, source_path: str, checkpoint_path: str):
-    """
-    Setup Auto Loader for CDC events (JSON format).
-    
-    CDC events are read as a stream and processed for idempotent merges.
-    """
-    df = spark.readStream \
-        .format("cloudFiles") \
-        .option("cloudFiles.format", "json") \
-        .option("cloudFiles.schemaLocation", f"{checkpoint_path}/schema") \
-        .load(source_path)
-    
-    return df
+def write_autoloader_table(
+    stream: DataFrame,
+    target_table: str,
+    checkpoint_path: str,
+    available_now: bool = True,
+) -> StreamingQuery:
+    """Write a Delta stream with an isolated checkpoint per target table."""
+    writer = (
+        stream.writeStream.format("delta")
+        .option("checkpointLocation", f"{checkpoint_path}/state")
+        .option("mergeSchema", "true")
+        .outputMode("append")
+    )
+    if available_now:
+        writer = writer.trigger(availableNow=True)
+    return writer.toTable(target_table)

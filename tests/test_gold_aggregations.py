@@ -1,72 +1,76 @@
-"""Test Gold layer aggregations"""
+"""Unit tests for dimensional models and KPI reconciliation."""
+
+from __future__ import annotations
 
 import pytest
 from pyspark.sql import SparkSession
-from tests.fixtures.sample_data import create_sample_customers, create_sample_products, create_sample_orders
-from src.silver import transform_customers, transform_products, transform_orders
-from src.gold import create_dim_customer, create_dim_product, create_fact_orders, create_daily_sales_kpi
+from pyspark.sql import functions as F
+
+from src.gold import (
+    create_daily_sales_kpi,
+    create_dim_customer,
+    create_dim_product,
+    create_fact_orders,
+    validate_gold_aggregations,
+)
+from src.silver import transform_customers, transform_orders, transform_products
+from tests.fixtures.sample_data import (
+    create_sample_customers,
+    create_sample_orders,
+    create_sample_products,
+)
 
 
-def test_create_fact_orders(spark: SparkSession):
-    """Test fact orders table creation."""
-    orders_df = create_sample_orders(spark, num_orders=100)
-    transformed_orders = transform_orders(orders_df)
-    
-    fact_orders = create_fact_orders(transformed_orders)
-    
-    assert fact_orders.count() == 100
-    assert "order_id" in fact_orders.columns
-    assert "customer_id" in fact_orders.columns
-    assert "product_id" in fact_orders.columns
+def test_fact_orders_filters_soft_deleted_rows(spark: SparkSession):
+    orders = transform_orders(create_sample_orders(spark, num_orders=5)).withColumn(
+        "is_deleted",
+        F.col("order_id") == "ORD_000000",
+    )
+    facts = create_fact_orders(orders)
+    assert facts.count() == 4
+    assert facts.filter("order_id = 'ORD_000000'").count() == 0
 
 
-def test_create_dim_customer(spark: SparkSession):
-    """Test customer dimension creation."""
-    customers_df = create_sample_customers(spark, num_records=10)
-    transformed_customers = transform_customers(customers_df)
-    
-    orders_df = create_sample_orders(spark, num_customers=10, num_orders=50)
-    transformed_orders = transform_orders(orders_df)
-    fact_orders = create_fact_orders(transformed_orders)
-    
-    dim_customer = create_dim_customer(transformed_customers, fact_orders)
-    
-    assert dim_customer.count() > 0
-    assert "total_orders" in dim_customer.columns
-    assert "total_spend" in dim_customer.columns
-    assert "is_active" in dim_customer.columns
+def test_customer_dimension_includes_customers_without_orders(spark: SparkSession):
+    customers = transform_customers(create_sample_customers(spark, 3))
+    orders = transform_orders(create_sample_orders(spark, num_customers=1, num_orders=4))
+    dimension = create_dim_customer(customers, create_fact_orders(orders))
+    assert dimension.count() == 3
+    inactive = dimension.filter("customer_id = 'CUST_00002'").first()
+    assert inactive.total_orders == 0
+    assert inactive.total_spend == pytest.approx(0.0)
+    assert inactive.is_active is False
 
 
-def test_create_dim_product(spark: SparkSession):
-    """Test product dimension creation."""
-    products_df = create_sample_products(spark, num_records=10)
-    transformed_products = transform_products(products_df)
-    
-    orders_df = create_sample_orders(spark, num_products=10, num_orders=50)
-    transformed_orders = transform_orders(orders_df)
-    fact_orders = create_fact_orders(transformed_orders)
-    
-    dim_product = create_dim_product(transformed_products, fact_orders)
-    
-    assert dim_product.count() > 0
-    assert "units_sold" in dim_product.columns
-    assert "total_revenue" in dim_product.columns
+def test_product_dimension_calculates_sales(spark: SparkSession):
+    products = transform_products(create_sample_products(spark, 2))
+    orders = transform_orders(create_sample_orders(spark, num_products=1, num_orders=4))
+    dimension = create_dim_product(products, create_fact_orders(orders))
+    sold = dimension.filter("product_id = 'PROD_00000'").first()
+    unsold = dimension.filter("product_id = 'PROD_00001'").first()
+    assert sold.units_sold > 0
+    assert sold.total_revenue > 0
+    assert unsold.units_sold == 0
+    assert unsold.is_active is False
 
 
-def test_create_daily_sales_kpi(spark: SparkSession):
-    """Test daily KPI aggregation."""
-    orders_df = create_sample_orders(spark, num_orders=100)
-    transformed_orders = transform_orders(orders_df)
-    fact_orders = create_fact_orders(transformed_orders)
-    
-    daily_kpi = create_daily_sales_kpi(fact_orders)
-    
-    assert daily_kpi.count() > 0
-    assert "total_sales_amount" in daily_kpi.columns
-    assert "total_orders" in daily_kpi.columns
-    assert "unique_customers" in daily_kpi.columns
-    
-    # Verify aggregations
-    total_orders_kpi = daily_kpi.select("total_orders").rdd.map(lambda x: x[0]).sum()
-    total_orders_fact = fact_orders.count()
-    assert total_orders_kpi == total_orders_fact
+def test_daily_kpi_has_exact_order_total(spark: SparkSession):
+    facts = create_fact_orders(transform_orders(create_sample_orders(spark, num_orders=100)))
+    kpi = create_daily_sales_kpi(facts)
+    assert kpi.agg(F.sum("total_orders")).first()[0] == 100
+    assert "unique_customers" in kpi.columns
+    assert "avg_order_value" in kpi.columns
+
+
+def test_gold_reconciliation_passes(spark: SparkSession):
+    facts = create_fact_orders(transform_orders(create_sample_orders(spark, num_orders=20)))
+    assert validate_gold_aggregations(facts, create_daily_sales_kpi(facts))
+
+
+def test_gold_reconciliation_detects_mismatch(spark: SparkSession):
+    facts = create_fact_orders(transform_orders(create_sample_orders(spark, num_orders=20)))
+    bad_kpi = create_daily_sales_kpi(facts).withColumn(
+        "total_orders",
+        F.col("total_orders") + 1,
+    )
+    assert not validate_gold_aggregations(facts, bad_kpi)

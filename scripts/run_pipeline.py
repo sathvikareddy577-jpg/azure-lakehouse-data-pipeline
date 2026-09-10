@@ -1,174 +1,311 @@
-"""Pipeline orchestration - Main entry point for running the lakehouse pipeline"""
+"""Orchestrate the Bronze, Silver, CDC, and Gold pipeline stages."""
 
-import sys
+from __future__ import annotations
+
 import argparse
-import logging
+import json
+import sys
 from pathlib import Path
+from typing import Any
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.common import get_spark_session, setup_logging, get_logger, Config
+from pyspark.sql import DataFrame, SparkSession
+
 from src.bronze import ingest_csv_to_bronze, read_bronze_table
-from src.silver import (
-    transform_customers, transform_products, transform_orders,
-    validate_nulls, validate_date_format, validate_numeric_ranges,
-    remove_duplicates, write_silver_table, write_quarantine,
-    calculate_quality_metrics
+from src.common import Config, get_logger, get_spark_session, setup_logging
+from src.data_models import (
+    BRONZE_CUSTOMERS_SCHEMA,
+    BRONZE_ORDERS_SCHEMA,
+    BRONZE_PRODUCTS_SCHEMA,
+    CUSTOMER_CDC_SCHEMA,
 )
 from src.gold import (
-    create_dim_customer, create_dim_product, create_fact_orders,
-    create_daily_sales_kpi, write_gold_table, validate_gold_aggregations
+    create_daily_sales_kpi,
+    create_dim_customer,
+    create_dim_product,
+    create_fact_orders,
+    validate_gold_aggregations,
+    write_gold_table,
 )
-from src.data_models import (
-    BRONZE_CUSTOMERS_SCHEMA, BRONZE_PRODUCTS_SCHEMA, BRONZE_ORDERS_SCHEMA
+from src.silver import (
+    calculate_quality_metrics,
+    combine_quarantine,
+    merge_customers_cdc,
+    remove_duplicates,
+    transform_customers,
+    transform_orders,
+    transform_products,
+    validate_nulls,
+    validate_numeric_ranges,
+    validate_references,
+    write_quarantine,
+    write_silver_table,
 )
 
 
-def run_bronze_layer(spark, data_path: str, warehouse_path: str, logger):
-    """Run Bronze layer ingestion."""
-    logger.info("=" * 60)
-    logger.info("BRONZE LAYER - Raw Data Ingest")
-    logger.info("=" * 60)
-    
-    # Ingest customers
-    customers_csv = f"{data_path}/raw/customers.csv"
-    bronze_customers = ingest_csv_to_bronze(
-        spark, customers_csv, BRONZE_CUSTOMERS_SCHEMA,
-        "bronze_customers", warehouse_path, source_system="csv"
+def _table_count(spark: SparkSession, path: str) -> int:
+    return spark.read.format("delta").load(path).count()
+
+
+def run_bronze_layer(
+    spark: SparkSession,
+    raw_data_path: str,
+    warehouse_path: str,
+    logger,
+) -> dict[str, int]:
+    """Ingest all three source files with replay-safe Delta merges."""
+    logger.info("BRONZE | ingesting immutable source records")
+    specifications = (
+        ("customers", BRONZE_CUSTOMERS_SCHEMA),
+        ("products", BRONZE_PRODUCTS_SCHEMA),
+        ("orders", BRONZE_ORDERS_SCHEMA),
     )
-    
-    # Ingest products
-    products_csv = f"{data_path}/raw/products.csv"
-    bronze_products = ingest_csv_to_bronze(
-        spark, products_csv, BRONZE_PRODUCTS_SCHEMA,
-        "bronze_products", warehouse_path, source_system="csv"
+    counts: dict[str, int] = {}
+    for entity, schema in specifications:
+        ingest_csv_to_bronze(
+            spark,
+            f"{raw_data_path}/{entity}.csv",
+            schema,
+            f"bronze_{entity}",
+            warehouse_path,
+            source_system="retail_csv",
+        )
+        counts[entity] = _table_count(
+            spark,
+            f"{warehouse_path}/bronze/bronze_{entity}",
+        )
+    logger.info("BRONZE | complete | %s", counts)
+    return counts
+
+
+def _customer_quality(df: DataFrame):
+    required = ["customer_id", "name", "email", "age", "country"]
+    valid, missing = validate_nulls(df, required)
+    valid, ranges = validate_numeric_ranges(valid, {"age": (18, 120)})
+    valid, duplicates = remove_duplicates(valid, ["customer_id"])
+    return valid, combine_quarantine(missing, ranges), duplicates
+
+
+def _product_quality(df: DataFrame):
+    required = ["product_id", "product_name", "category", "unit_price"]
+    valid, missing = validate_nulls(df, required)
+    valid, ranges = validate_numeric_ranges(valid, {"unit_price": (0.01, 1_000_000)})
+    valid, duplicates = remove_duplicates(valid, ["product_id"])
+    return valid, combine_quarantine(missing, ranges), duplicates
+
+
+def _order_quality(
+    df: DataFrame,
+    customers: DataFrame,
+    products: DataFrame,
+):
+    required = [
+        "order_id",
+        "customer_id",
+        "product_id",
+        "order_date",
+        "order_amount",
+        "order_quantity",
+    ]
+    valid, missing = validate_nulls(df, required)
+    valid, ranges = validate_numeric_ranges(
+        valid,
+        {"order_amount": (0.0, 1_000_000_000), "order_quantity": (1, 1_000_000)},
     )
-    
-    # Ingest orders
-    orders_csv = f"{data_path}/raw/orders.csv"
-    bronze_orders = ingest_csv_to_bronze(
-        spark, orders_csv, BRONZE_ORDERS_SCHEMA,
-        "bronze_orders", warehouse_path, source_system="csv"
+    valid, references = validate_references(
+        valid,
+        {
+            "customer_id": (
+                customers.filter("is_deleted = false"),
+                "customer_id",
+            ),
+            "product_id": (products.filter("is_active = true"), "product_id"),
+        },
     )
-    
-    logger.info(f"✓ Bronze layer complete: {bronze_customers.count()} customers, "
-                f"{bronze_products.count()} products, {bronze_orders.count()} orders")
+    valid, duplicates = remove_duplicates(valid, ["order_id"])
+    return valid, combine_quarantine(missing, ranges, references), duplicates
 
 
-def run_silver_layer(spark, warehouse_path: str, logger):
-    """Run Silver layer transformations with validation."""
-    logger.info("=" * 60)
-    logger.info("SILVER LAYER - Cleanse & Validate")
-    logger.info("=" * 60)
-    
-    # Read Bronze
-    bronze_customers = read_bronze_table(spark, "bronze_customers", warehouse_path)
-    bronze_products = read_bronze_table(spark, "bronze_products", warehouse_path)
-    bronze_orders = read_bronze_table(spark, "bronze_orders", warehouse_path)
-    
-    # Transform customers
-    logger.info("Processing customers...")
-    silver_customers = transform_customers(bronze_customers)
-    valid_customers, quarantine_customers = validate_nulls(silver_customers, ["customer_id"])
-    write_silver_table(valid_customers, "silver_customers", warehouse_path)
-    write_quarantine(quarantine_customers, warehouse_path)
-    
-    # Transform products
-    logger.info("Processing products...")
-    silver_products = transform_products(bronze_products)
-    write_silver_table(silver_products, "silver_products", warehouse_path)
-    
-    # Transform orders
-    logger.info("Processing orders...")
-    silver_orders = transform_orders(bronze_orders)
-    valid_orders, quarantine_orders = validate_nulls(silver_orders, ["order_id", "customer_id"])
-    if quarantine_orders:
-        write_quarantine(quarantine_orders, warehouse_path)
-    
-    # Deduplicate orders
-    deduped_orders, removed = remove_duplicates(valid_orders, ["order_id", "customer_id", "order_date"])
-    write_silver_table(deduped_orders, "silver_orders", warehouse_path)
-    
-    # Calculate metrics
-    metrics = calculate_quality_metrics(silver_orders, deduped_orders, quarantine_orders)
-    logger.info(f"Quality metrics: {metrics['quality_percentage']:.2f}% valid records")
-    
-    logger.info("✓ Silver layer complete")
+def run_silver_layer(
+    spark: SparkSession,
+    warehouse_path: str,
+    logger,
+    cdc_path: str | None = None,
+) -> dict[str, Any]:
+    """Transform, validate, quarantine, deduplicate, and apply optional CDC."""
+    logger.info("SILVER | standardizing and enforcing data contracts")
+
+    customer_source = transform_customers(
+        read_bronze_table(spark, "bronze_customers", warehouse_path)
+    )
+    customers, customer_quarantine, customer_duplicates = _customer_quality(customer_source)
+    customer_metrics = calculate_quality_metrics(
+        customer_source,
+        customers,
+        customer_quarantine,
+    )
+    write_silver_table(customers, "silver_customers", warehouse_path)
+    customer_rejections = write_quarantine(
+        customer_quarantine,
+        warehouse_path,
+        "customers",
+        "customer_id",
+    )
+
+    cdc_rows = 0
+    if cdc_path:
+        cdc = spark.read.schema(CUSTOMER_CDC_SCHEMA).json(cdc_path)
+        cdc_rows = cdc.count()
+        merge_customers_cdc(spark, f"{warehouse_path}/silver", cdc)
+    customers = spark.read.format("delta").load(f"{warehouse_path}/silver/silver_customers")
+
+    product_source = transform_products(read_bronze_table(spark, "bronze_products", warehouse_path))
+    products, product_quarantine, product_duplicates = _product_quality(product_source)
+    write_silver_table(products, "silver_products", warehouse_path)
+    product_rejections = write_quarantine(
+        product_quarantine,
+        warehouse_path,
+        "products",
+        "product_id",
+    )
+
+    order_source = transform_orders(read_bronze_table(spark, "bronze_orders", warehouse_path))
+    orders, order_quarantine, order_duplicates = _order_quality(
+        order_source,
+        customers,
+        products,
+    )
+    write_silver_table(orders, "silver_orders", warehouse_path)
+    order_rejections = write_quarantine(
+        order_quarantine,
+        warehouse_path,
+        "orders",
+        "order_id",
+    )
+
+    metrics = {
+        "customers": customer_metrics,
+        "products": calculate_quality_metrics(
+            product_source,
+            products,
+            product_quarantine,
+        ),
+        "orders": calculate_quality_metrics(order_source, orders, order_quarantine),
+        "duplicates_removed": {
+            "customers": customer_duplicates,
+            "products": product_duplicates,
+            "orders": order_duplicates,
+        },
+        "quarantine_rows": {
+            "customers": customer_rejections,
+            "products": product_rejections,
+            "orders": order_rejections,
+        },
+        "cdc_input_rows": cdc_rows,
+    }
+    logger.info("SILVER | complete | %s", json.dumps(metrics, sort_keys=True))
+    return metrics
 
 
-def run_gold_layer(spark, warehouse_path: str, logger):
-    """Run Gold layer aggregations."""
-    logger.info("=" * 60)
-    logger.info("GOLD LAYER - Analytics Ready")
-    logger.info("=" * 60)
-    
-    # Read Silver
-    silver_customers = spark.read.format("delta").load(f"{warehouse_path}/silver/silver_customers")
-    silver_products = spark.read.format("delta").load(f"{warehouse_path}/silver/silver_products")
-    silver_orders = spark.read.format("delta").load(f"{warehouse_path}/silver/silver_orders")
-    
-    # Create fact orders
-    fact_orders = create_fact_orders(silver_orders)
-    write_gold_table(fact_orders, "fact_orders", warehouse_path)
-    
-    # Create dimensions
-    dim_customer = create_dim_customer(silver_customers, fact_orders)
-    write_gold_table(dim_customer, "dim_customer", warehouse_path)
-    
-    dim_product = create_dim_product(silver_products, fact_orders)
-    write_gold_table(dim_product, "dim_product", warehouse_path)
-    
-    # Create KPIs
-    daily_kpi = create_daily_sales_kpi(fact_orders)
-    write_gold_table(daily_kpi, "daily_sales_kpi", warehouse_path)
-    
-    # Validate
-    if validate_gold_aggregations(spark, fact_orders, daily_kpi):
-        logger.info("✓ Gold layer complete - all validations passed")
-    else:
-        logger.error("✗ Gold layer validation failed")
+def run_gold_layer(
+    spark: SparkSession,
+    warehouse_path: str,
+    logger,
+) -> dict[str, int]:
+    """Build star-schema outputs and reconcile KPIs to the order fact."""
+    logger.info("GOLD | building dimensions, facts, and daily KPIs")
+    customers = spark.read.format("delta").load(f"{warehouse_path}/silver/silver_customers")
+    products = spark.read.format("delta").load(f"{warehouse_path}/silver/silver_products")
+    orders = spark.read.format("delta").load(f"{warehouse_path}/silver/silver_orders")
+
+    facts = create_fact_orders(orders)
+    customer_dimension = create_dim_customer(customers, facts)
+    product_dimension = create_dim_product(products, facts)
+    daily_kpi = create_daily_sales_kpi(facts)
+
+    if not validate_gold_aggregations(facts, daily_kpi):
+        raise RuntimeError("Gold reconciliation failed; refusing to publish outputs")
+
+    counts = {
+        "fact_orders": write_gold_table(facts, "fact_orders", warehouse_path),
+        "dim_customer": write_gold_table(
+            customer_dimension,
+            "dim_customer",
+            warehouse_path,
+        ),
+        "dim_product": write_gold_table(
+            product_dimension,
+            "dim_product",
+            warehouse_path,
+        ),
+        "daily_sales_kpi": write_gold_table(
+            daily_kpi,
+            "daily_sales_kpi",
+            warehouse_path,
+        ),
+    }
+    logger.info("GOLD | complete and reconciled | %s", counts)
+    return counts
 
 
-def main():
-    """Main pipeline entry point."""
-    parser = argparse.ArgumentParser(description="Azure Lakehouse Data Pipeline")
-    parser.add_argument("--layer", choices=["bronze", "silver", "gold", "full"],
-                        default="full", help="Which layer(s) to run")
-    parser.add_argument("--data-path", type=str, default="data", help="Data directory")
-    parser.add_argument("--warehouse-path", type=str, default="data/warehouse", help="Warehouse directory")
-    parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
-    
-    args = parser.parse_args()
-    
-    # Setup
-    Config.ensure_paths()
-    setup_logging(log_level=args.log_level)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--layer",
+        choices=["bronze", "silver", "gold", "full"],
+        default="full",
+    )
+    parser.add_argument(
+        "--raw-data-path",
+        "--data-path",
+        dest="raw_data_path",
+        default="data/raw",
+    )
+    parser.add_argument("--warehouse-path", default=Config.WAREHOUSE_PATH)
+    parser.add_argument("--cdc-path")
+    parser.add_argument("--log-level", default=Config.LOG_LEVEL)
+    parser.add_argument("--log-file", default=Config.LOG_FILE)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    Config.ensure_paths(args.raw_data_path, args.warehouse_path)
+    setup_logging(args.log_level, args.log_file)
     logger = get_logger("pipeline")
-    
-    spark = get_spark_session("lakehouse-pipeline", args.warehouse_path)
-    
+    spark = get_spark_session("azure-lakehouse-pipeline", args.warehouse_path)
+    summary: dict[str, Any] = {}
+
     try:
-        if args.layer in ["bronze", "full"]:
-            run_bronze_layer(spark, args.data_path, args.warehouse_path, logger)
-        
-        if args.layer in ["silver", "full"]:
-            run_silver_layer(spark, args.warehouse_path, logger)
-        
-        if args.layer in ["gold", "full"]:
-            run_gold_layer(spark, args.warehouse_path, logger)
-        
-        logger.info("=" * 60)
-        logger.info("✓ PIPELINE COMPLETE")
-        logger.info("=" * 60)
-    
-    except Exception as e:
-        logger.error(f"✗ Pipeline failed: {e}", exc_info=True)
-        sys.exit(1)
-    
+        if args.layer in {"bronze", "full"}:
+            summary["bronze"] = run_bronze_layer(
+                spark,
+                args.raw_data_path,
+                args.warehouse_path,
+                logger,
+            )
+        if args.layer in {"silver", "full"}:
+            summary["silver"] = run_silver_layer(
+                spark,
+                args.warehouse_path,
+                logger,
+                args.cdc_path,
+            )
+        if args.layer in {"gold", "full"}:
+            summary["gold"] = run_gold_layer(
+                spark,
+                args.warehouse_path,
+                logger,
+            )
+        logger.info("PIPELINE COMPLETE | %s", json.dumps(summary, sort_keys=True))
+        return 0
+    except Exception:
+        logger.exception("PIPELINE FAILED")
+        return 1
     finally:
         spark.stop()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

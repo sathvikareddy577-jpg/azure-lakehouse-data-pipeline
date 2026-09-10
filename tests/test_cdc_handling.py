@@ -1,70 +1,135 @@
-"""Test CDC idempotency handling"""
+"""Delta integration tests for real customer CDC behavior."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
 
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType
+
+from src.data_models import CUSTOMER_CDC_SCHEMA
+from src.silver import merge_customers_cdc, transform_customers
 from tests.fixtures.sample_data import create_sample_customers
-from src.silver import transform_customers
+
+pytestmark = pytest.mark.integration
 
 
-def test_cdc_duplicate_event_idempotency(spark: SparkSession, tmp_warehouse: str):
-    """Test that duplicate CDC events don't create duplicates."""
-    # Create initial customer
-    customers_df = create_sample_customers(spark, num_records=1)
-    transformed = transform_customers(customers_df)
-    
-    # Write to Silver
-    silver_path = f"{tmp_warehouse}/silver/silver_customers"
-    transformed.write.format("delta").mode("overwrite").save(silver_path)
-    
-    # Simulate duplicate CDC event (same customer, same timestamp)
-    df1 = transformed
-    df2 = transformed  # Duplicate
-    
-    # Union (simulating two identical CDC events)
-    merged = df1.union(df2)
-    
-    # After deduplication
-    deduped = merged.dropDuplicates(["customer_id"])
-    
-    # Should still have 1 record (idempotency)
-    assert deduped.count() == 1
+def _write_customer_target(
+    spark: SparkSession,
+    warehouse: str,
+    count: int = 2,
+) -> str:
+    path = f"{warehouse}/silver"
+    transform_customers(create_sample_customers(spark, count)).write.format("delta").mode(
+        "overwrite"
+    ).save(f"{path}/silver_customers")
+    return path
 
 
-def test_cdc_insert_new_customer(spark: SparkSession):
-    """Test CDC INSERT event."""
-    from pyspark.sql.functions import lit, current_timestamp, to_date
-    
-    customers_df = create_sample_customers(spark, num_records=1)
-    
-    # Simulate CDC INSERT event
-    cdc_df = customers_df.withColumn("operation", lit("INSERT"))
-    
-    assert cdc_df.count() == 1
-    assert "operation" in cdc_df.columns
+def _cdc(spark: SparkSession, rows: list[tuple]):
+    return spark.createDataFrame(rows, CUSTOMER_CDC_SCHEMA)
 
 
-def test_cdc_update_customer(spark: SparkSession):
-    """Test CDC UPDATE event."""
-    from pyspark.sql.functions import lit, col
-    
-    customers_df = create_sample_customers(spark, num_records=1)
-    
-    # Simulate CDC UPDATE: change name
-    updated_df = customers_df.withColumn("name", lit("Updated Name")).withColumn("operation", lit("UPDATE"))
-    
-    assert updated_df.count() == 1
-    assert updated_df.select("name").collect()[0][0] == "Updated Name"
+def test_cdc_insert_is_replay_safe(delta_spark: SparkSession, tmp_warehouse: str):
+    silver_path = _write_customer_target(delta_spark, tmp_warehouse)
+    event_time = datetime(2026, 9, 10, 12, 0)
+    events = _cdc(
+        delta_spark,
+        [("E1", "CUST_NEW", "INSERT", "New User", "new@example.com", 30, "usa", event_time, "crm")],
+    )
+    assert merge_customers_cdc(delta_spark, silver_path, events) == 3
+    assert merge_customers_cdc(delta_spark, silver_path, events) == 3
 
 
-def test_cdc_delete_customer(spark: SparkSession):
-    """Test CDC DELETE event (soft delete)."""
-    from pyspark.sql.functions import lit
-    
-    customers_df = create_sample_customers(spark, num_records=1)
-    
-    # Simulate CDC DELETE event
-    deleted_df = customers_df.withColumn("operation", lit("DELETE"))
-    
-    assert deleted_df.count() == 1
-    assert "operation" in deleted_df.columns
+def test_cdc_update_preserves_missing_attributes(
+    delta_spark: SparkSession,
+    tmp_warehouse: str,
+):
+    silver_path = _write_customer_target(delta_spark, tmp_warehouse)
+    events = _cdc(
+        delta_spark,
+        [
+            (
+                "E2",
+                "CUST_00000",
+                "UPDATE",
+                "Changed Name",
+                None,
+                None,
+                None,
+                datetime(2026, 9, 10, 13, 0),
+                "crm",
+            )
+        ],
+    )
+    merge_customers_cdc(delta_spark, silver_path, events)
+    row = (
+        delta_spark.read.format("delta")
+        .load(f"{silver_path}/silver_customers")
+        .filter("customer_id = 'CUST_00000'")
+        .first()
+    )
+    assert row.name == "Changed Name"
+    assert row.email == "customer0@example.com"
+
+
+def test_cdc_delete_is_soft_delete(delta_spark: SparkSession, tmp_warehouse: str):
+    silver_path = _write_customer_target(delta_spark, tmp_warehouse)
+    events = _cdc(
+        delta_spark,
+        [
+            (
+                "E3",
+                "CUST_00001",
+                "DELETE",
+                None,
+                None,
+                None,
+                None,
+                datetime(2026, 9, 10, 14, 0),
+                "crm",
+            )
+        ],
+    )
+    merge_customers_cdc(delta_spark, silver_path, events)
+    row = (
+        delta_spark.read.format("delta")
+        .load(f"{silver_path}/silver_customers")
+        .filter("customer_id = 'CUST_00001'")
+        .first()
+    )
+    assert row.is_deleted is True
+    assert row.end_date.isoformat() == "2026-09-10"
+
+
+def test_cdc_uses_latest_event_per_customer(
+    delta_spark: SparkSession,
+    tmp_warehouse: str,
+):
+    silver_path = _write_customer_target(delta_spark, tmp_warehouse)
+    timestamp = datetime(2026, 9, 10, 15, 0)
+    events = _cdc(
+        delta_spark,
+        [
+            ("E4", "CUST_00000", "UPDATE", "Old Name", None, None, None, timestamp, "crm"),
+            (
+                "E5",
+                "CUST_00000",
+                "UPDATE",
+                "Latest Name",
+                None,
+                None,
+                None,
+                timestamp + timedelta(minutes=1),
+                "crm",
+            ),
+        ],
+    )
+    merge_customers_cdc(delta_spark, silver_path, events)
+    row = (
+        delta_spark.read.format("delta")
+        .load(f"{silver_path}/silver_customers")
+        .filter("customer_id = 'CUST_00000'")
+        .first()
+    )
+    assert row.name == "Latest Name"
