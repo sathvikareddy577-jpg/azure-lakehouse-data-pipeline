@@ -1,0 +1,14 @@
+{
+  "name": "ADLSGen2LinkedService",
+  "properties": {
+    "type": "AzureBlobFS",
+    "typeProperties": {
+      "url": "https://lakehousedata.dfs.core.windows.net",
+      "accountKey": {
+        "type": "SecureString",
+        "value": "*** Provide storage account key ***"
+      }
+    },
+    "description": "Linked Service for Azure Data Lake Storage Gen2"
+  }
+}
