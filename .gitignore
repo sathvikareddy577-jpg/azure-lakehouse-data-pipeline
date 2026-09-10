@@ -1,0 +1,62 @@
+# Environment
+.env
+.env.local
+*.pyc
+__pycache__/
+.Python
+venv/
+env/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test and coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs
+logs/
+*.log
+
+# Data (local development only)
+data/raw/*.csv
+data/cdc/*.json
+data/warehouse/
+metastore_db/
+spark-warehouse/
+
+# Build
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Azure/Cloud
+.azure/
+*.tfstate
+*.tfstate.backup
+.terraform/
+terraform.tfvars
+
+# IDE project files
+.vscode/settings.json
+
+# Note: Never commit:
+# - .env files with secrets
+# - Local data files (use .env to specify paths)
+# - AWS/Azure credentials
+# - Database connections with passwords
