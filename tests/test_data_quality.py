@@ -1,55 +1,71 @@
-"""Test data quality rules"""
+"""Unit tests for dates, numeric rules, and referential integrity."""
+
+from __future__ import annotations
+
+from datetime import date
 
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
-from tests.fixtures.sample_data import create_sample_customers, create_sample_orders
-from src.silver import validate_date_format, validate_numeric_ranges
+
+from src.silver import (
+    combine_quarantine,
+    validate_date_format,
+    validate_numeric_ranges,
+    validate_references,
+)
 
 
-def test_date_validation(spark: SparkSession):
-    """Test date format validation."""
-    orders_df = create_sample_orders(spark, num_orders=100)
-    
-    # Add invalid dates
-    from pyspark.sql.functions import when
-    invalid_orders = orders_df.withColumn(
-        "order_date", when(col("order_id") == "ORD_000001", "invalid-date").otherwise(col("order_date"))
+def test_date_validation_parses_and_quarantines(spark: SparkSession):
+    source = spark.createDataFrame(
+        [("1", "2026-09-10"), ("2", "invalid"), ("3", None)],
+        ["id", "event_date"],
     )
-    
-    valid_df, quarantine_df = validate_date_format(invalid_orders, {"order_date": "yyyy-MM-dd"})
-    
-    assert valid_df.count() + quarantine_df.count() == 100
-    assert quarantine_df.count() > 0
+    valid, quarantine = validate_date_format(source, {"event_date": "yyyy-MM-dd"})
+    assert valid.count() == 2
+    assert quarantine is not None and quarantine.count() == 1
+    assert valid.filter("id = '1'").first().event_date == date(2026, 9, 10)
 
 
-def test_numeric_range_validation(spark: SparkSession):
-    """Test numeric range validation."""
-    customers_df = create_sample_customers(spark, num_records=100)
-    
-    # Add out-of-range ages
-    from pyspark.sql.functions import when
-    invalid_customers = customers_df.withColumn(
-        "age", when(col("customer_id") == "CUST_00000", 200).otherwise(col("age"))
+def test_date_validation_honors_requested_format(spark: SparkSession):
+    source = spark.createDataFrame([("09/10/2026",)], ["event_date"])
+    valid, quarantine = validate_date_format(source, {"event_date": "MM/dd/yyyy"})
+    assert quarantine is not None and quarantine.count() == 0
+    assert valid.first().event_date == date(2026, 9, 10)
+
+
+def test_numeric_validation_catches_range_and_type(spark: SparkSession):
+    source = spark.createDataFrame(
+        [("1", "50"), ("2", "200"), ("3", "not-a-number")],
+        ["id", "age"],
     )
-    
-    range_rules = {"age": (0, 150)}
-    valid_df, quarantine_df = validate_numeric_ranges(invalid_customers, range_rules)
-    
-    assert valid_df.count() + quarantine_df.count() == 100
+    valid, quarantine = validate_numeric_ranges(source, {"age": (0, 150)})
+    assert valid.count() == 1
+    assert quarantine is not None and quarantine.count() == 2
 
 
-def test_business_rule_validation(spark: SparkSession):
-    """Test business rule validation (order_amount >= 0)."""
-    orders_df = create_sample_orders(spark, num_orders=100)
-    
-    # All should have positive amounts
-    from pyspark.sql.functions import when
-    invalid_orders = orders_df.withColumn(
-        "order_amount", when(col("order_id") == "ORD_000001", "-100").otherwise(col("order_amount"))
+def test_reference_validation_quarantines_orphan(spark: SparkSession):
+    orders = spark.createDataFrame([("O1", "C1"), ("O2", "C9")], ["order_id", "customer_id"])
+    customers = spark.createDataFrame([("C1",)], ["customer_id"])
+    valid, quarantine = validate_references(
+        orders,
+        {"customer_id": (customers, "customer_id")},
     )
-    
-    range_rules = {"order_amount": (0, 100000)}
-    valid_df, quarantine_df = validate_numeric_ranges(invalid_orders, range_rules)
-    
-    assert quarantine_df.count() > 0
+    assert [row.order_id for row in valid.collect()] == ["O1"]
+    assert quarantine is not None
+    assert [row.order_id for row in quarantine.collect()] == ["O2"]
+
+
+def test_combine_quarantine_preserves_missing_columns(spark: SparkSession):
+    first = spark.createDataFrame([("1", "reason-a")], ["id", "rejection_reason"])
+    second = spark.createDataFrame([("x", "reason-b")], ["code", "rejection_reason"])
+    combined = combine_quarantine(first, None, second)
+    assert combined is not None
+    assert combined.count() == 2
+    assert set(combined.columns) == {"id", "code", "rejection_reason"}
+
+
+def test_reference_validation_requires_local_column(spark: SparkSession):
+    source = spark.createDataFrame([("1",)], ["id"])
+    reference = spark.createDataFrame([("C1",)], ["customer_id"])
+    with pytest.raises(ValueError, match="customer_id"):
+        validate_references(source, {"customer_id": (reference, "customer_id")})

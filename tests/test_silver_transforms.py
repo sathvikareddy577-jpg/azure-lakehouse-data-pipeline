@@ -1,64 +1,106 @@
-"""Test Silver layer transformations"""
+"""Unit tests for Silver transformations and common quality metrics."""
+
+from __future__ import annotations
+
+from datetime import date
 
 import pytest
-from pyspark.sql import SparkSession
-from tests.fixtures.sample_data import create_sample_customers, create_sample_orders
+from pyspark.sql import Row, SparkSession
+from pyspark.sql import functions as F
+
 from src.silver import (
-    transform_customers,
-    validate_nulls,
-    remove_duplicates,
     calculate_quality_metrics,
+    remove_duplicates,
+    transform_customers,
+    transform_orders,
+    transform_products,
+    validate_nulls,
 )
+from tests.fixtures.sample_data import create_sample_customers
 
 
-def test_transform_customers(spark: SparkSession):
-    """Test customer transformation."""
-    customers_df = create_sample_customers(spark, num_records=10)
-    transformed = transform_customers(customers_df)
-    
-    assert transformed.count() == 10
-    assert "is_deleted" in transformed.columns
-    assert "effective_date" in transformed.columns
-    assert "updated_at" in transformed.columns
-
-
-def test_validate_nulls(spark: SparkSession):
-    """Test null value validation."""
-    customers_df = create_sample_customers(spark, num_records=10)
-    
-    # Add some nulls
-    from pyspark.sql.functions import when, col
-    customers_with_nulls = customers_df.withColumn(
-        "email", when(col("age") > 50, None).otherwise(col("email"))
+def test_transform_customers_normalizes_values(spark: SparkSession):
+    source = spark.createDataFrame(
+        [(" CUST_1 ", " jane DOE ", " JANE@EXAMPLE.COM ", "42", " us ")],
+        ["customer_id", "name", "email", "age", "country"],
     )
-    
-    valid_df, quarantine_df = validate_nulls(customers_with_nulls, ["customer_id", "email"])
-    
-    assert valid_df.count() + quarantine_df.count() == 10
-    assert quarantine_df.count() > 0
+    row = transform_customers(source).first()
+    assert row.customer_id == "CUST_1"
+    assert row.name == "Jane Doe"
+    assert row.email == "jane@example.com"
+    assert row.age == 42
+    assert row.country == "US"
+    assert row.is_deleted is False
+    assert row.effective_date == date.today()
 
 
-def test_remove_duplicates(spark: SparkSession):
-    """Test duplicate removal."""
-    customers_df = create_sample_customers(spark, num_records=5)
-    duplicated_df = customers_df.union(customers_df)
-    
-    deduped_df, removed_count = remove_duplicates(duplicated_df, ["customer_id"])
-    
-    assert deduped_df.count() == 5
-    assert removed_count == 5
+def test_transform_products_casts_price(spark: SparkSession):
+    source = spark.createDataFrame(
+        [(" P1 ", " Phone ", " electronics ", "499.95")],
+        ["product_id", "product_name", "category", "unit_price"],
+    )
+    row = transform_products(source).first()
+    assert row.product_id == "P1"
+    assert row.category == "ELECTRONICS"
+    assert row.unit_price == pytest.approx(499.95)
+    assert row.is_active is True
 
 
-def test_calculate_quality_metrics(spark: SparkSession):
-    """Test quality metrics calculation."""
-    original_df = create_sample_customers(spark, num_records=100)
-    
-    from pyspark.sql.functions import when, col
-    valid_df = original_df.filter(col("age").isNotNull())
-    quarantine_df = original_df.filter(col("age").isNull())
-    
-    metrics = calculate_quality_metrics(original_df, valid_df, quarantine_df)
-    
-    assert metrics["original_records"] == 100
-    assert metrics["valid_records"] + metrics["quarantine_records"] == 100
-    assert metrics["quality_percentage"] >= 0
+def test_transform_orders_exposes_bad_casts_as_null(spark: SparkSession):
+    source = spark.createDataFrame(
+        [("O1", "C1", "P1", "bad-date", "not-money", "x")],
+        [
+            "order_id",
+            "customer_id",
+            "product_id",
+            "order_date",
+            "order_amount",
+            "order_quantity",
+        ],
+    )
+    row = transform_orders(source).first()
+    assert row.order_date is None
+    assert row.order_amount is None
+    assert row.order_quantity is None
+
+
+def test_transform_defaults_missing_source_metadata(spark: SparkSession):
+    transformed = transform_customers(create_sample_customers(spark, 1))
+    assert transformed.first().source_system == "unknown"
+
+
+def test_validate_nulls_catches_null_and_blank(spark: SparkSession):
+    source = spark.createDataFrame(
+        [("1", "ok"), ("2", " "), ("3", None)],
+        ["id", "email"],
+    )
+    valid, quarantine = validate_nulls(source, ["email"])
+    assert valid.count() == 1
+    assert quarantine.count() == 2
+    assert "Missing required value" in quarantine.first().rejection_reason
+
+
+def test_validate_nulls_rejects_empty_rule_list(spark: SparkSession):
+    source = spark.createDataFrame([Row(id="1")])
+    with pytest.raises(ValueError, match="at least one"):
+        validate_nulls(source, [])
+
+
+def test_remove_duplicates_reports_count(spark: SparkSession):
+    source = spark.createDataFrame([("1",), ("1",), ("2",)], ["id"])
+    deduplicated, removed = remove_duplicates(source, ["id"])
+    assert deduplicated.count() == 2
+    assert removed == 1
+
+
+def test_quality_metrics_are_record_level(spark: SparkSession):
+    source = spark.range(10)
+    valid = source.filter(F.col("id") < 8)
+    quarantine = source.filter(F.col("id") >= 8)
+    metrics = calculate_quality_metrics(source, valid, quarantine)
+    assert metrics == {
+        "original_records": 10.0,
+        "valid_records": 8.0,
+        "quarantine_records": 2.0,
+        "quality_percentage": 80.0,
+    }

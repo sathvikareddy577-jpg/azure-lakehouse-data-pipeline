@@ -1,0 +1,33 @@
+{
+  "name": "DatabricksLinkedService",
+  "properties": {
+    "annotations": [
+      "managed-identity",
+      "portfolio-template"
+    ],
+    "parameters": {
+      "workspaceDomain": {
+        "type": "String"
+      },
+      "workspaceResourceId": {
+        "type": "String"
+      }
+    },
+    "type": "AzureDatabricks",
+    "typeProperties": {
+      "domain": {
+        "type": "Expression",
+        "value": "@linkedService().workspaceDomain"
+      },
+      "authentication": "MSI",
+      "workspaceResourceId": {
+        "type": "Expression",
+        "value": "@linkedService().workspaceResourceId"
+      },
+      "newClusterVersion": "15.4.x-scala2.12",
+      "newClusterNodeType": "Standard_DS3_v2",
+      "newClusterNumOfWorker": "2"
+    },
+    "description": "Azure Databricks jobs cluster authenticated with the Data Factory managed identity."
+  }
+}

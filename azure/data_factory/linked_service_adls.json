@@ -1,0 +1,22 @@
+{
+  "name": "ADLSGen2LinkedService",
+  "properties": {
+    "annotations": [
+      "managed-identity",
+      "portfolio-template"
+    ],
+    "parameters": {
+      "storageAccountName": {
+        "type": "String"
+      }
+    },
+    "type": "AzureBlobFS",
+    "typeProperties": {
+      "url": {
+        "type": "Expression",
+        "value": "@concat('https://', linkedService().storageAccountName, '.dfs.core.windows.net')"
+      }
+    },
+    "description": "ADLS Gen2 connection using the Data Factory managed identity; no account keys are stored."
+  }
+}

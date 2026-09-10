@@ -22,6 +22,9 @@ pip-delete-this-directory.txt
 .pytest_cache/
 .coverage
 htmlcov/
+.ruff_cache/
+coverage.xml
+junit.xml
 .tox/
 
 # Logs
@@ -51,6 +54,8 @@ build/
 *.tfstate.backup
 .terraform/
 terraform.tfvars
+*.tfplan
+crash.log
 
 # IDE project files
 .vscode/settings.json

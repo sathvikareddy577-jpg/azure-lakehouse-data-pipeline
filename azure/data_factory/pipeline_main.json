@@ -1,24 +1,47 @@
 {
-  "name": "lakehouse-pipeline-adf",
+  "name": "pl_lakehouse_medallion",
   "properties": {
-    "description": "Azure Lakehouse Data Pipeline - Main ADF Pipeline",
+    "description": "Orchestrates Bronze, Silver/CDC, and Gold Databricks notebook stages.",
+    "folder": {
+      "name": "lakehouse"
+    },
+    "parameters": {
+      "rawDataPath": {
+        "type": "String"
+      },
+      "warehousePath": {
+        "type": "String"
+      },
+      "cdcPath": {
+        "type": "String",
+        "defaultValue": ""
+      }
+    },
     "activities": [
       {
-        "name": "BronzeLayerActivity",
-        "type": "DatabricksSparkPython",
+        "name": "Run Bronze",
+        "type": "DatabricksNotebook",
         "dependsOn": [],
         "policy": {
-          "timeout": "7.00:00:00",
-          "retry": 1,
-          "retryIntervalInSeconds": 30
+          "timeout": "0.01:00:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
         },
-        "userProperties": [],
         "typeProperties": {
-          "notebookPath": "/Repos/lakehouse-pipeline/azure/databricks/notebook_main",
+          "notebookPath": "/Repos/<user>/azure-lakehouse-data-pipeline/azure/databricks/notebook_main",
           "baseParameters": {
-            "stage": "bronze"
-          },
-          "libraries": []
+            "stage": "bronze",
+            "raw_data_path": {
+              "type": "Expression",
+              "value": "@pipeline().parameters.rawDataPath"
+            },
+            "warehouse_path": {
+              "type": "Expression",
+              "value": "@pipeline().parameters.warehousePath"
+            }
+          }
         },
         "linkedServiceName": {
           "referenceName": "DatabricksLinkedService",
@@ -26,28 +49,36 @@
         }
       },
       {
-        "name": "SilverLayerActivity",
-        "type": "DatabricksSparkPython",
+        "name": "Run Silver and CDC",
+        "type": "DatabricksNotebook",
         "dependsOn": [
           {
-            "activity": "BronzeLayerActivity",
+            "activity": "Run Bronze",
             "dependencyConditions": [
               "Succeeded"
             ]
           }
         ],
         "policy": {
-          "timeout": "7.00:00:00",
-          "retry": 1,
-          "retryIntervalInSeconds": 30
+          "timeout": "0.01:00:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
         },
-        "userProperties": [],
         "typeProperties": {
-          "notebookPath": "/Repos/lakehouse-pipeline/azure/databricks/notebook_main",
+          "notebookPath": "/Repos/<user>/azure-lakehouse-data-pipeline/azure/databricks/notebook_main",
           "baseParameters": {
-            "stage": "silver"
-          },
-          "libraries": []
+            "stage": "silver",
+            "warehouse_path": {
+              "type": "Expression",
+              "value": "@pipeline().parameters.warehousePath"
+            },
+            "cdc_path": {
+              "type": "Expression",
+              "value": "@pipeline().parameters.cdcPath"
+            }
+          }
         },
         "linkedServiceName": {
           "referenceName": "DatabricksLinkedService",
@@ -55,34 +86,43 @@
         }
       },
       {
-        "name": "GoldLayerActivity",
-        "type": "DatabricksSparkPython",
+        "name": "Run Gold",
+        "type": "DatabricksNotebook",
         "dependsOn": [
           {
-            "activity": "SilverLayerActivity",
+            "activity": "Run Silver and CDC",
             "dependencyConditions": [
               "Succeeded"
             ]
           }
         ],
         "policy": {
-          "timeout": "7.00:00:00",
-          "retry": 1,
-          "retryIntervalInSeconds": 30
+          "timeout": "0.01:00:00",
+          "retry": 2,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
         },
-        "userProperties": [],
         "typeProperties": {
-          "notebookPath": "/Repos/lakehouse-pipeline/azure/databricks/notebook_main",
+          "notebookPath": "/Repos/<user>/azure-lakehouse-data-pipeline/azure/databricks/notebook_main",
           "baseParameters": {
-            "stage": "gold"
-          },
-          "libraries": []
+            "stage": "gold",
+            "warehouse_path": {
+              "type": "Expression",
+              "value": "@pipeline().parameters.warehousePath"
+            }
+          }
         },
         "linkedServiceName": {
           "referenceName": "DatabricksLinkedService",
           "type": "LinkedServiceReference"
         }
       }
+    ],
+    "annotations": [
+      "medallion",
+      "databricks",
+      "managed-identity"
     ]
   }
 }

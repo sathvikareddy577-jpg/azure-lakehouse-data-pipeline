@@ -1,95 +1,61 @@
-"""
-Databricks notebook main for Azure Lakehouse Pipeline
-This notebook is meant to run in Databricks and use ADLS Gen2 for storage.
-
-To run:
-1. Import this notebook into your Databricks workspace
-2. Attach to a cluster with PySpark 3.3+
-3. Configure ADLS Gen2 credentials
-4. Run all cells
-
-Parameters:
-- warehouse_path: abfss://warehouse@lakehousedata.dfs.core.windows.net
-- raw_data_path: abfss://raw@lakehousedata.dfs.core.windows.net
-"""
+# Databricks notebook source
+"""Parameterized Databricks notebook entry point for the medallion pipeline."""
 
 # COMMAND ----------
 
-# Import required libraries
+from __future__ import annotations
+
 import sys
-sys.path.append('/Workspace/Repos/lakehouse-pipeline')
+from pathlib import Path
+from typing import Any
 
-from src.common import get_spark_session, setup_logging, get_logger
-from src.bronze import ingest_csv_to_bronze
-from src.silver import transform_customers, transform_products, validate_nulls, write_silver_table
-from src.gold import create_dim_customer, create_fact_orders
+repo_root = str(Path.cwd())
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
-setup_logging()
-logger = get_logger("databricks-notebook")
+from scripts.run_pipeline import run_bronze_layer, run_gold_layer, run_silver_layer
+from src.common import get_logger, setup_logging
 
-# COMMAND ----------
-
-# Configuration
-warehouse_path = "abfss://warehouse@lakehousedata.dfs.core.windows.net"
-raw_data_path = "abfss://raw@lakehousedata.dfs.core.windows.net"
-
-logger.info(f"Warehouse Path: {warehouse_path}")
-logger.info(f"Raw Data Path: {raw_data_path}")
+runtime: dict[str, Any] = globals()
+spark_session = runtime.get("spark")
+dbutils_runtime = runtime.get("dbutils")
+if spark_session is None or dbutils_runtime is None:
+    raise RuntimeError("This entry point must run inside an Azure Databricks notebook")
 
 # COMMAND ----------
 
-# Bronze Layer: Ingest data
-logger.info("Starting Bronze layer ingest...")
+defaults = {
+    "stage": "full",
+    "raw_data_path": "abfss://raw@<storage-account>.dfs.core.windows.net",
+    "warehouse_path": "abfss://warehouse@<storage-account>.dfs.core.windows.net",
+    "cdc_path": "",
+}
+for widget_name, default_value in defaults.items():
+    dbutils_runtime.widgets.text(widget_name, default_value)
 
-# Customers
-customers_path = f"{raw_data_path}/customers.csv"
-bronze_customers = spark.read.csv(customers_path, header=True, inferSchema=True)
-bronze_customers.write.format("delta").mode("overwrite").save(f"{warehouse_path}/bronze/customers")
+stage = dbutils_runtime.widgets.get("stage").strip().lower()
+raw_data_path = dbutils_runtime.widgets.get("raw_data_path").rstrip("/")
+warehouse_path = dbutils_runtime.widgets.get("warehouse_path").rstrip("/")
+cdc_path = dbutils_runtime.widgets.get("cdc_path").strip() or None
 
-# Products
-products_path = f"{raw_data_path}/products.csv"
-bronze_products = spark.read.csv(products_path, header=True, inferSchema=True)
-bronze_products.write.format("delta").mode("overwrite").save(f"{warehouse_path}/bronze/products")
+if stage not in {"bronze", "silver", "gold", "full"}:
+    raise ValueError(f"Unsupported stage: {stage}")
+if "<storage-account>" in raw_data_path or "<storage-account>" in warehouse_path:
+    raise ValueError("Replace <storage-account> in the Databricks widget paths")
 
-# Orders
-orders_path = f"{raw_data_path}/orders.csv"
-bronze_orders = spark.read.csv(orders_path, header=True, inferSchema=True)
-bronze_orders.write.format("delta").mode("overwrite").save(f"{warehouse_path}/bronze/orders")
-
-logger.info("✓ Bronze layer complete")
-
-# COMMAND ----------
-
-# Silver Layer: Transform and validate
-logger.info("Starting Silver layer transforms...")
-
-bronze_customers = spark.read.format("delta").load(f"{warehouse_path}/bronze/customers")
-silver_customers = transform_customers(bronze_customers)
-valid_customers, quarantine = validate_nulls(silver_customers, ["customer_id"])
-
-write_silver_table(valid_customers, "customers", warehouse_path)
-logger.info("✓ Silver layer complete")
+setup_logging("INFO")
+logger = get_logger("databricks")
 
 # COMMAND ----------
 
-# Gold Layer: Aggregate for analytics
-logger.info("Starting Gold layer aggregations...")
+if stage in {"bronze", "full"}:
+    run_bronze_layer(spark_session, raw_data_path, warehouse_path, logger)
 
-silver_customers = spark.read.format("delta").load(f"{warehouse_path}/silver/customers")
-silver_orders = spark.read.format("delta").load(f"{warehouse_path}/silver/orders")
+if stage in {"silver", "full"}:
+    run_silver_layer(spark_session, warehouse_path, logger, cdc_path)
 
-# Create dimension
-dim_customer = create_dim_customer(silver_customers, silver_orders)
-dim_customer.write.format("delta").mode("overwrite").save(f"{warehouse_path}/gold/dim_customer")
+if stage in {"gold", "full"}:
+    run_gold_layer(spark_session, warehouse_path, logger)
 
-logger.info("✓ Gold layer complete")
-
-# COMMAND ----------
-
-# Show sample data from Gold layer
-gold_customers = spark.read.format("delta").load(f"{warehouse_path}/gold/dim_customer")
-display(gold_customers.limit(10))
-
-# COMMAND ----------
-
-logger.info("✓ Databricks notebook pipeline complete!")
+logger.info("Databricks stage completed: %s", stage)
+dbutils_runtime.notebook.exit(f"SUCCESS: {stage}")

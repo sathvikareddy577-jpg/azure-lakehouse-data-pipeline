@@ -1,8 +1,8 @@
 """Common utilities module"""
 
-from .logging import setup_logging, get_logger
-from .spark_utils import get_spark_session, stop_spark_session
 from .config import Config
+from .logging import get_logger, setup_logging
+from .spark_utils import get_spark_session, stop_spark_session
 
 __all__ = [
     "setup_logging",
